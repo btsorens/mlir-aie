@@ -1,5 +1,8 @@
-#include "../aie_kernel_utils.h"
+#include "aie_kernel_utils.h"
 #include <lut_based_ops.h>
+
+// Include the lookup table definitions directly
+#include "../../aie_runtime_lib/AIE2/lut_based_ops.cpp"
 
 template <const int N>
 void exp_bf16_func(bfloat16 *restrict in, bfloat16 *restrict out) {
