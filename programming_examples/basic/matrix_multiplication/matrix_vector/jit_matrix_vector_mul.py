@@ -12,6 +12,7 @@ from aie.iron import Program, Runtime, Worker, ObjectFifo
 from aie.iron.placers import SequentialPlacer
 from aie.iron import ExternalFunction, jit
 from aie.iron.controlflow import range_
+from aie.iron.device import Tile
 from aie.helpers.taplib import TensorAccessPattern
 import aie.iron as iron
 
@@ -35,12 +36,11 @@ def matrix_vector_mul_jit(inputA, inputB, outputC):
 
     # Memtile buffer types (n_cores sub-buffers interleaved, one per compute tile)
     A_mem_ty = np.ndarray[(n_cores * m * k,), np.dtype[np.int16]]   # 4096 int16
-    B_mem_ty = np.ndarray[(n_cores * k,), np.dtype[np.int16]]       # 128 int16
     C_mem_ty = np.ndarray[(n_cores * m,), np.dtype[np.int32]]       # 128 int32
 
     # Host buffer types
     A_ty = np.ndarray[(M * K,), np.dtype[np.int16]]
-    B_ty = np.ndarray[(rows_per_core * K_div_k * n_cores * k,), np.dtype[np.int16]]
+    B_ty = np.ndarray[(rows_per_core * K_div_k * k,), np.dtype[np.int16]]
     C_ty = np.ndarray[(M,), np.dtype[np.int32]]
 
     # External kernel function
@@ -57,28 +57,26 @@ def matrix_vector_mul_jit(inputA, inputB, outputC):
 
     # --- ObjectFifos ---
 
-    # A: shim → mem tile → split to 4 compute tiles
+    # A: shim → mem tile (col 0) → split to 4 compute tiles
     # DMA channels on A mem tile: 1 input + 4 outputs = 5 (≤6)
     A_fifo = ObjectFifo(A_mem_ty, name="inA")
     a_fifos = A_fifo.cons().split(
         offsets=[0, m * k, 2 * m * k, 3 * m * k],
         obj_types=[inA_ty, inA_ty, inA_ty, inA_ty],
+        placement=Tile(0, 1),
     )
 
-    # B: shim → mem tile → split to 4 compute tiles
-    # DMA channels on B mem tile: 1 input + 4 outputs = 5 (≤6)
-    B_fifo = ObjectFifo(B_mem_ty, name="inB")
-    b_fifos = B_fifo.cons().split(
-        offsets=[0, k, 2 * k, 3 * k],
-        obj_types=[inB_ty, inB_ty, inB_ty, inB_ty],
-    )
+    # B: shim → mem tile (col 1) → forward (broadcast) to 4 compute tiles
+    B_fifo = ObjectFifo(inB_ty, name="inB")
+    B_fwd = B_fifo.cons().forward(placement=Tile(1, 1))
 
-    # C: 4 compute tiles → join → mem tile → shim
+    # C: 4 compute tiles → join → mem tile (col 2) → shim
     # DMA channels on C mem tile: 4 inputs + 1 output = 5 (≤6)
     C_fifo = ObjectFifo(C_mem_ty, name="outC")
     c_fifos = C_fifo.prod().join(
         offsets=[0, m, 2 * m, 3 * m],
         obj_types=[outC_ty, outC_ty, outC_ty, outC_ty],
+        placement=Tile(2, 1),
     )
 
     # --- Core function ---
@@ -97,19 +95,19 @@ def matrix_vector_mul_jit(inputA, inputB, outputC):
                 b_in.release(1)
             c_out.release(1)
 
-    # --- Workers (4 compute tiles) ---
+    # --- Workers (4 compute tiles on col 0, rows 2-5) ---
     workers = []
     for i in range(n_cores):
         w = Worker(
             core_fn,
-            fn_args=[a_fifos[i].cons(), b_fifos[i].cons(), c_fifos[i].prod(), matvec],
+            fn_args=[a_fifos[i].cons(), B_fwd.cons(), c_fifos[i].prod(), matvec],
+            placement=Tile(0, 2 + i),
         )
         workers.append(w)
 
     # Fifo element counts
     n_fifo_elems = rows_per_core * K_div_k  # 16
     A_elem_size = n_cores * m * k           # 4096 int16 per fifo element
-    B_elem_size = n_cores * k               # 128 int16 per fifo element
 
     # --- Runtime ---
     rt = Runtime()
@@ -124,15 +122,18 @@ def matrix_vector_mul_jit(inputA, inputB, outputC):
                 sizes=[n_fifo_elems, 8, 512],
                 strides=[A_elem_size, 512, 1],
             ),
+            placement=Tile(0, 0),
         )
+        # B: no replication needed, forward broadcasts to all compute tiles
         rt.fill(
             in_fifo=B_fifo.prod(), source=b_in,
             tap=TensorAccessPattern(
-                tensor_dims=[rows_per_core * K_div_k * n_cores * k],
+                tensor_dims=[rows_per_core * K_div_k * k],
                 offset=0,
-                sizes=[n_fifo_elems, B_elem_size],
-                strides=[B_elem_size, 1],
+                sizes=[n_fifo_elems, k],
+                strides=[k, 1],
             ),
+            placement=Tile(1, 0),
         )
         rt.drain(
             out_fifo=C_fifo.cons(), dest=c_out, wait=True,
@@ -142,6 +143,7 @@ def matrix_vector_mul_jit(inputA, inputB, outputC):
                 sizes=[rows_per_core, n_cores * m],
                 strides=[n_cores * m, 1],
             ),
+            placement=Tile(2, 0),
         )
 
     return Program(iron.get_current_device(), rt).resolve_program(SequentialPlacer())
@@ -185,19 +187,10 @@ def main():
     A_buf = prepare_A(A_data)
 
     # --- Prepare B host buffer ---
-    # Each fifo element = n_cores copies of the same B tile (broadcast via split).
-    # Same ordering as A: rows_per_core * K_div_k fifo elements.
+    # B is forwarded (broadcast) to all compute tiles, so no replication needed.
+    # Just repeat the full vector for each row block iteration.
 
-    def prepare_B(b_data):
-        buf = []
-        for _ in range(rows_per_core):
-            for cb in range(K_div_k):
-                b_tile = b_data[cb * k:(cb + 1) * k]
-                for _ in range(n_cores):
-                    buf.append(b_tile)
-        return np.concatenate(buf)
-
-    B_buf = prepare_B(b_data)
+    B_buf = np.tile(b_data, rows_per_core)
 
     # --- Create device tensors ---
     inputA = iron.zeros(len(A_buf), dtype=np.int16, device="npu")
