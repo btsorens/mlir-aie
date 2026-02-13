@@ -83,27 +83,22 @@ def matrix_vector_mul_jit(inputA, inputB, outputC):
     # Each compute tile: 1 A input + 1 B input = 2 input DMA channels (≤2)
     #                     1 C output = 1 output DMA channel (≤2)
     def core_fn(a_in, b_in, c_out, matvec):
-        for _ in range_(rows_per_core):
-            elem_out = c_out.acquire(1)
-            for i in range_(m):
-                elem_out[i] = 0
-            for _ in range_(K_div_k):
-                elem_a = a_in.acquire(1)
-                elem_b = b_in.acquire(1)
-                matvec(elem_a, elem_b, elem_out)
-                a_in.release(1)
-                b_in.release(1)
-            c_out.release(1)
+        elem_out = c_out.acquire(1)
+        for i in range_(m):
+            elem_out[i] = 0
+        for _ in range_(K_div_k):
+            elem_a = a_in.acquire(1)
+            elem_b = b_in.acquire(1)
+            matvec(elem_a, elem_b, elem_out)
+            a_in.release(1)
+            b_in.release(1)
+        c_out.release(1)
 
     # --- Workers (4 compute tiles on col 0, rows 2-5) ---
-    workers = []
-    for i in range(n_cores):
-        w = Worker(
-            core_fn,
-            fn_args=[a_fifos[i].cons(), B_fwd.cons(), c_fifos[i].prod(), matvec],
-            placement=Tile(0, 2 + i),
-        )
-        workers.append(w)
+    worker0 = Worker(core_fn, fn_args=[a_fifos[0].cons(), B_fwd.cons(), c_fifos[0].prod(), matvec], placement=Tile(0, 2))
+    worker1 = Worker(core_fn, fn_args=[a_fifos[1].cons(), B_fwd.cons(), c_fifos[1].prod(), matvec], placement=Tile(0, 3))
+    worker2 = Worker(core_fn, fn_args=[a_fifos[2].cons(), B_fwd.cons(), c_fifos[2].prod(), matvec], placement=Tile(0, 4))
+    worker3 = Worker(core_fn, fn_args=[a_fifos[3].cons(), B_fwd.cons(), c_fifos[3].prod(), matvec], placement=Tile(0, 5))
 
     # Fifo element counts
     n_fifo_elems = rows_per_core * K_div_k  # 16
@@ -112,7 +107,7 @@ def matrix_vector_mul_jit(inputA, inputB, outputC):
     # --- Runtime ---
     rt = Runtime()
     with rt.sequence(A_ty, B_ty, C_ty) as (a_in, b_in, c_out):
-        rt.start(*workers)
+        rt.start(worker0, worker1, worker2, worker3)
         # A_elem_size=4096 exceeds BD max dim size of 1023, so split: 4096 = 8 * 512
         rt.fill(
             in_fifo=A_fifo.prod(), source=a_in,
