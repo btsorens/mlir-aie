@@ -12,30 +12,38 @@ from aie.iron import Program, Runtime, Worker, ObjectFifo
 from aie.iron.placers import SequentialPlacer
 from aie.iron import ExternalFunction, jit
 from aie.iron.controlflow import range_
+from aie.helpers.taplib import TensorAccessPattern
 import aie.iron as iron
 
 
 @iron.jit(is_placed=False)
 def matrix_vector_mul_jit(inputA, inputB, outputC):
     # Matrix dimensions
-    M = 288
-    K = 288
+    M = 256
+    K = 256
     m = 32  # tile rows (matches DIM_M default in mv.cc)
     k = 32  # tile cols (matches DIM_K default in mv.cc)
-    M_div_m = M // m
-    K_div_k = K // k
+    n_cores = 4
+    M_div_m = M // m                    # 8 row blocks total
+    K_div_k = K // k                    # 8 col blocks total
+    rows_per_core = M_div_m // n_cores  # 2 row blocks per compute tile
 
     # Define tile types
     inA_ty = np.ndarray[(m, k), np.dtype[np.int16]]
     inB_ty = np.ndarray[(k,), np.dtype[np.int16]]
     outC_ty = np.ndarray[(m,), np.dtype[np.int32]]
 
-    # Sequence buffer types (flat)
-    A_seq_ty = np.ndarray[(M * K,), np.dtype[np.int16]]
-    B_seq_ty = np.ndarray[(M_div_m * K,), np.dtype[np.int16]]  # B repeated per row block
-    C_seq_ty = np.ndarray[(M,), np.dtype[np.int32]]
+    # Memtile buffer types (n_cores sub-buffers interleaved, one per compute tile)
+    A_mem_ty = np.ndarray[(n_cores * m * k,), np.dtype[np.int16]]   # 4096 int16
+    B_mem_ty = np.ndarray[(n_cores * k,), np.dtype[np.int16]]       # 128 int16
+    C_mem_ty = np.ndarray[(n_cores * m,), np.dtype[np.int32]]       # 128 int32
 
-    # Generate handles to externally defined kernel functions
+    # Host buffer types
+    A_ty = np.ndarray[(M * K,), np.dtype[np.int16]]
+    B_ty = np.ndarray[(rows_per_core * K_div_k * n_cores * k,), np.dtype[np.int16]]
+    C_ty = np.ndarray[(M,), np.dtype[np.int32]]
+
+    # External kernel function
     matvec = ExternalFunction(
         name="matvec_vectorized_i16_i32",
         source_file="/scratch/IRONSmithTesting/mlir-aie/aie_kernels/aie2/mv.cc",
@@ -46,100 +54,160 @@ def matrix_vector_mul_jit(inputA, inputB, outputC):
             "/scratch/IRONSmithTesting/mlir-aie/aie_runtime_lib/AIE2",
         ],
     )
-    zero = ExternalFunction(
-        name="zero_vectorized_i32",
-        source_file="/scratch/IRONSmithTesting/mlir-aie/aie_kernels/aie2/mv.cc",
-        arg_types=[outC_ty],
-        include_dirs=[
-            "/scratch/IRONSmithTesting/mlir-aie/aie_kernels",
-            "/scratch/IRONSmithTesting/mlir-aie/aie_kernels/aie2",
-            "/scratch/IRONSmithTesting/mlir-aie/aie_runtime_lib/AIE2",
-        ],
+
+    # --- ObjectFifos ---
+
+    # A: shim → mem tile → split to 4 compute tiles
+    # DMA channels on A mem tile: 1 input + 4 outputs = 5 (≤6)
+    A_fifo = ObjectFifo(A_mem_ty, name="inA")
+    a_fifos = A_fifo.cons().split(
+        offsets=[0, m * k, 2 * m * k, 3 * m * k],
+        obj_types=[inA_ty, inA_ty, inA_ty, inA_ty],
     )
 
-    # Dataflow with ObjectFifos
-    A_fifo = ObjectFifo(inA_ty, name="inA")
-    B_fifo = ObjectFifo(inB_ty, name="inB")
-    C_fifo = ObjectFifo(outC_ty, name="outC")
-    # Fifo to pass zeroed output tiles from zero worker to matvec worker
-    zero_to_matvec_fifo = ObjectFifo(outC_ty, name="zeroC")
+    # B: shim → mem tile → split to 4 compute tiles
+    # DMA channels on B mem tile: 1 input + 4 outputs = 5 (≤6)
+    B_fifo = ObjectFifo(B_mem_ty, name="inB")
+    b_fifos = B_fifo.cons().split(
+        offsets=[0, k, 2 * k, 3 * k],
+        obj_types=[inB_ty, inB_ty, inB_ty, inB_ty],
+    )
 
-    # Zero worker: zeros output tiles on a separate tile
-    def zero_fn(of_out, zero):
-        for _ in range_(M_div_m):
-            elem_out = of_out.acquire(1)
-            zero(elem_out)
-            of_out.release(1)
+    # C: 4 compute tiles → join → mem tile → shim
+    # DMA channels on C mem tile: 4 inputs + 1 output = 5 (≤6)
+    C_fifo = ObjectFifo(C_mem_ty, name="outC")
+    c_fifos = C_fifo.prod().join(
+        offsets=[0, m, 2 * m, 3 * m],
+        obj_types=[outC_ty, outC_ty, outC_ty, outC_ty],
+    )
 
-    # Matvec worker: accumulates matrix-vector products into zeroed output
-    def matvec_fn(of_a, of_b, of_zeroed, of_c, matvec):
-        for _ in range_(M_div_m):
-            elem_zeroed = of_zeroed.acquire(1)
-            elem_out = of_c.acquire(1)
-            # Copy zeroed tile to output
+    # --- Core function ---
+    # Each compute tile: 1 A input + 1 B input = 2 input DMA channels (≤2)
+    #                     1 C output = 1 output DMA channel (≤2)
+    def core_fn(a_in, b_in, c_out, matvec):
+        for _ in range_(rows_per_core):
+            elem_out = c_out.acquire(1)
             for i in range_(m):
-                elem_out[i] = elem_zeroed[i]
-            of_zeroed.release(1)
+                elem_out[i] = 0
             for _ in range_(K_div_k):
-                elem_in_a = of_a.acquire(1)
-                elem_in_b = of_b.acquire(1)
-                matvec(elem_in_a, elem_in_b, elem_out)
-                of_a.release(1)
-                of_b.release(1)
-            of_c.release(1)
+                elem_a = a_in.acquire(1)
+                elem_b = b_in.acquire(1)
+                matvec(elem_a, elem_b, elem_out)
+                a_in.release(1)
+                b_in.release(1)
+            c_out.release(1)
 
-    # Create workers on separate tiles
-    zero_worker = Worker(
-        zero_fn,
-        fn_args=[zero_to_matvec_fifo.prod(), zero],
-    )
-    matvec_worker = Worker(
-        matvec_fn,
-        fn_args=[A_fifo.cons(), B_fifo.cons(), zero_to_matvec_fifo.cons(), C_fifo.prod(), matvec],
-    )
+    # --- Workers (4 compute tiles) ---
+    workers = []
+    for i in range(n_cores):
+        w = Worker(
+            core_fn,
+            fn_args=[a_fifos[i].cons(), b_fifos[i].cons(), c_fifos[i].prod(), matvec],
+        )
+        workers.append(w)
 
-    # Runtime operations to move data to/from the AIE-array
+    # Fifo element counts
+    n_fifo_elems = rows_per_core * K_div_k  # 16
+    A_elem_size = n_cores * m * k           # 4096 int16 per fifo element
+    B_elem_size = n_cores * k               # 128 int16 per fifo element
+
+    # --- Runtime ---
     rt = Runtime()
-    with rt.sequence(A_seq_ty, B_seq_ty, C_seq_ty) as (a_in, b_in, c_out):
-        rt.start(zero_worker, matvec_worker)
-        rt.fill(A_fifo.prod(), a_in)
-        rt.fill(B_fifo.prod(), b_in)
-        rt.drain(C_fifo.cons(), c_out, wait=True)
+    with rt.sequence(A_ty, B_ty, C_ty) as (a_in, b_in, c_out):
+        rt.start(*workers)
+        # A_elem_size=4096 exceeds BD max dim size of 1023, so split: 4096 = 8 * 512
+        rt.fill(
+            in_fifo=A_fifo.prod(), source=a_in,
+            tap=TensorAccessPattern(
+                tensor_dims=[M * K],
+                offset=0,
+                sizes=[n_fifo_elems, 8, 512],
+                strides=[A_elem_size, 512, 1],
+            ),
+        )
+        rt.fill(
+            in_fifo=B_fifo.prod(), source=b_in,
+            tap=TensorAccessPattern(
+                tensor_dims=[rows_per_core * K_div_k * n_cores * k],
+                offset=0,
+                sizes=[n_fifo_elems, B_elem_size],
+                strides=[B_elem_size, 1],
+            ),
+        )
+        rt.drain(
+            out_fifo=C_fifo.cons(), dest=c_out, wait=True,
+            tap=TensorAccessPattern(
+                tensor_dims=[M],
+                offset=0,
+                sizes=[rows_per_core, n_cores * m],
+                strides=[n_cores * m, 1],
+            ),
+        )
 
-    # Place program components and generate an MLIR module
     return Program(iron.get_current_device(), rt).resolve_program(SequentialPlacer())
 
 
 def main():
-    M = 288
-    K = 288
+    M = 256
+    K = 256
     m = 32
     k = 32
-    M_div_m = M // m
-    K_div_k = K // k
+    n_cores = 4
+    M_div_m = M // m         # 8
+    K_div_k = K // k          # 8
+    rows_per_core = M_div_m // n_cores  # 2
 
     # Create input data
     np.random.seed(42)
     A_data = np.random.randint(-16, 16, size=(M, K)).astype(np.int16)
     b_data = np.random.randint(-16, 16, size=(K,)).astype(np.int16)
 
-    # Tile A into (m, k) blocks in row-block-major order, then apply
-    # 32-bit word transposition within each block as required by
-    # matvec_vectorized (column-major at 4-byte / 2-element granularity)
-    A_blocked = A_data.reshape(M_div_m, m, K_div_k, k).transpose(0, 2, 1, 3)
-    A_blocked = A_blocked.reshape(M_div_m, K_div_k, m, k // 2, 2)
-    A_blocked = A_blocked.transpose(0, 1, 3, 2, 4)
-    A_tiled = A_blocked.reshape(-1).copy()
+    # --- Prepare A host buffer ---
+    # Layout: n_fifo_elems fifo elements, each = n_cores interleaved (m,k) tiles
+    # with 32-bit word transposition for matvec_vectorized.
+    #
+    # Consumption order: for each row block iteration (rows_per_core=2),
+    # for each col block (K_div_k=8), each compute tile gets one (m,k) tile.
+    # Fifo element i contains tiles for all 4 compute tiles at the same col block.
 
-    # B needs to be repeated M_div_m times since each row block re-reads the full vector
-    B_repeated = np.tile(b_data, M_div_m)
+    def prepare_A(A_data):
+        buf = []
+        for rb_group in range(rows_per_core):
+            for cb in range(K_div_k):
+                for core in range(n_cores):
+                    rb = core + rb_group * n_cores
+                    tile = A_data[rb * m:(rb + 1) * m, cb * k:(cb + 1) * k]
+                    # 32-bit word transposition for matvec_vectorized
+                    tile_t = tile.reshape(m, k // 2, 2).transpose(1, 0, 2).reshape(-1)
+                    buf.append(tile_t)
+        return np.concatenate(buf)
 
-    inputA = iron.zeros(M * K, dtype=np.int16, device="npu")
-    inputA.data[:] = A_tiled
+    A_buf = prepare_A(A_data)
+
+    # --- Prepare B host buffer ---
+    # Each fifo element = n_cores copies of the same B tile (broadcast via split).
+    # Same ordering as A: rows_per_core * K_div_k fifo elements.
+
+    def prepare_B(b_data):
+        buf = []
+        for _ in range(rows_per_core):
+            for cb in range(K_div_k):
+                b_tile = b_data[cb * k:(cb + 1) * k]
+                for _ in range(n_cores):
+                    buf.append(b_tile)
+        return np.concatenate(buf)
+
+    B_buf = prepare_B(b_data)
+
+    # --- Create device tensors ---
+    inputA = iron.zeros(len(A_buf), dtype=np.int16, device="npu")
+    inputA.data[:] = A_buf
     inputA._sync_to_device()
-    inputB = iron.zeros(M_div_m * K, dtype=np.int16, device="npu")
-    inputB.data[:] = B_repeated
+
+    inputB = iron.zeros(len(B_buf), dtype=np.int16, device="npu")
+    inputB.data[:] = B_buf
     inputB._sync_to_device()
+
     outputC = iron.zeros(M, dtype=np.int32, device="npu")
 
     # Run the JIT function
@@ -151,7 +219,10 @@ def main():
     expected = A_data.astype(np.int32) @ b_data.astype(np.int32)
     actual = np.asarray(outputC, dtype=np.int32)
 
-    # Print some sample values
+    # Output join order: [compute0, compute1, compute2, compute3] per round
+    #   Round 0: C[0:31], C[32:63], C[64:95], C[96:127]   (row blocks 0-3)
+    #   Round 1: C[128:159], C[160:191], C[192:223], C[224:255]  (row blocks 4-7)
+
     print("\nSample element-by-element comparison (first 10):")
     for i in range(min(10, M)):
         print(f"  Row {i}: Expected = {expected[i]} : Received = {actual[i]}")
