@@ -18,9 +18,11 @@ from aie.helpers.taplib import TensorAccessPattern
 
 @iron.jit(is_placed=False)
 def passthrough_test_jit(inputA, outputC):
+    N = 4096
+
     # Define tensor types
-    vector_ty = np.ndarray[(inputA.numel(),), np.dtype[np.int32]]
-    line_ty = np.ndarray[(inputA.numel() // 4,), np.dtype[np.int32]]
+    vector_ty = np.ndarray[(N,), np.dtype[np.int32]]
+    line_ty = np.ndarray[(N // 4,), np.dtype[np.int32]]
 
     # Data movement with ObjectFifos
     of_in = ObjectFifo(obj_type=line_ty, depth=2, name="of_in")
@@ -31,8 +33,8 @@ def passthrough_test_jit(inputA, outputC):
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
     with rt.sequence(vector_ty, vector_ty) as (inputa_in, outputc_out):
-        rt.fill(of_in.prod(), inputa_in)
-        rt.drain(of_out.cons(), outputc_out, wait=True)
+        rt.fill(of_in.prod(), inputa_in, placement=Tile(0, 0))
+        rt.drain(of_out.cons(), outputc_out, wait=True, placement=Tile(0, 0))
 
     # Create the program from the current device and runtime
     my_program = Program(iron.get_current_device(), rt)

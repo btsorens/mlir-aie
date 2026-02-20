@@ -1,4 +1,4 @@
-# add_activate_hlir_example.py -*- Python -*-
+# add_activate_test.py -*- Python -*-
 
 
 import numpy as np
@@ -17,7 +17,9 @@ from aie.helpers.taplib import TensorAccessPattern
 
 
 @iron.jit(is_placed=False)
-def add_activate_hlir_example_jit(A, B, D):
+def add_activate_test_jit(A, B, D):
+    data_size = 128
+
     # Define tensor types
     data_ty = np.ndarray[(A.numel(),), np.dtype[bfloat16]]
     chunk_ty = np.ndarray[(A.numel() // 4,), np.dtype[bfloat16]]
@@ -53,18 +55,18 @@ def add_activate_hlir_example_jit(A, B, D):
     of_out_d_col1 = ObjectFifo(obj_type=chunk_ty, depth=2, name="of_out_d_col1")
     of_out_d_col2 = ObjectFifo(obj_type=chunk_ty, depth=2, name="of_out_d_col2")
     of_out_d_col3 = ObjectFifo(obj_type=chunk_ty, depth=2, name="of_out_d_col3")
-    MEM_L2_L1_A1A2_col0 = of_in_a_col0.cons().split(obj_types=[chunk_a_worker, chunk_a_worker], offsets=[((A.numel() // 8) * 0), ((A.numel() // 8) * 1)], names=["MEM_L2_L1_A1_col0", "MEM_L2_L1_A2_col0"], placement=Tile(0, 1))
-    MEM_L2_L1_A3A4_col1 = of_in_a_col1.cons().split(obj_types=[chunk_a_worker, chunk_a_worker], offsets=[((A.numel() // 8) * 0), ((A.numel() // 8) * 1)], names=["MEM_L2_L1_A3_col1", "MEM_L2_L1_A4_col1"], placement=Tile(1, 1))
-    MEM_L2_L1_A5A6_col2 = of_in_a_col2.cons().split(obj_types=[chunk_a_worker, chunk_a_worker], offsets=[((A.numel() // 8) * 0), ((A.numel() // 8) * 1)], names=["MEM_L2_L1_A5_col2", "MEM_L2_L1_A6_col2"], placement=Tile(2, 1))
-    MEM_L2_L1_A7A8_col3 = of_in_a_col3.cons().split(obj_types=[chunk_a_worker, chunk_a_worker], offsets=[((A.numel() // 8) * 0), ((A.numel() // 8) * 1)], names=["MEM_L2_L1_A7_col3", "MEM_L2_L1_A8_col3"], placement=Tile(3, 1))
-    MEM_L2_L1_B1B2_col0 = of_in_b_col0.cons().split(obj_types=[chunk_b_worker, chunk_b_worker], offsets=[((B.numel() // 8) * 0), ((B.numel() // 8) * 1)], names=["MEM_L2_L1_B1_col0", "MEM_L2_L1_B2_col0"], placement=Tile(0, 1))
-    MEM_L2_L1_B3B4_col1 = of_in_b_col1.cons().split(obj_types=[chunk_b_worker, chunk_b_worker], offsets=[((B.numel() // 8) * 0), ((B.numel() // 8) * 1)], names=["MEM_L2_L1_B3_col1", "MEM_L2_L1_B4_col1"], placement=Tile(1, 1))
-    MEM_L2_L1_B5B6_col2 = of_in_b_col2.cons().split(obj_types=[chunk_b_worker, chunk_b_worker], offsets=[((B.numel() // 8) * 0), ((B.numel() // 8) * 1)], names=["MEM_L2_L1_B5_col2", "MEM_L2_L1_B6_col2"], placement=Tile(2, 1))
-    MEM_L2_L1_B7B8_col3 = of_in_b_col3.cons().split(obj_types=[chunk_b_worker, chunk_b_worker], offsets=[((B.numel() // 8) * 0), ((B.numel() // 8) * 1)], names=["MEM_L2_L1_B7_col3", "MEM_L2_L1_B8_col3"], placement=Tile(3, 1))
-    MEM_L1_L2_D1D2_col0 = of_out_d_col0.prod().join(obj_types=[chunk_d_worker, chunk_d_worker], names=["MEM_L1_L2_D1_col0", "MEM_L1_L2_D2_col0"], placement=Tile(0, 1), offsets=[((D.numel() // 8) * 0), ((D.numel() // 8) * 1)])
-    MEM_L1_L2_D3D4_col1 = of_out_d_col1.prod().join(obj_types=[chunk_d_worker, chunk_d_worker], names=["MEM_L1_L2_D3_col1", "MEM_L1_L2_D4_col1"], placement=Tile(1, 1), offsets=[((D.numel() // 8) * 0), ((D.numel() // 8) * 1)])
-    MEM_L1_L2_D5D6_col2 = of_out_d_col2.prod().join(obj_types=[chunk_d_worker, chunk_d_worker], names=["MEM_L1_L2_D5_col2", "MEM_L1_L2_D6_col2"], placement=Tile(2, 1), offsets=[((D.numel() // 8) * 0), ((D.numel() // 8) * 1)])
-    MEM_L1_L2_D7D8_col3 = of_out_d_col3.prod().join(obj_types=[chunk_d_worker, chunk_d_worker], names=["MEM_L1_L2_D7_col3", "MEM_L1_L2_D8_col3"], placement=Tile(3, 1), offsets=[((D.numel() // 8) * 0), ((D.numel() // 8) * 1)])
+    MEM_L2_L1_A1A2_col0 = of_in_a_col0.cons().split(obj_types=[chunk_a_worker, chunk_a_worker], offsets=[0, 16], names=["MEM_L2_L1_A1_col0", "MEM_L2_L1_A2_col0"], placement=Tile(0, 1))
+    MEM_L2_L1_A3A4_col1 = of_in_a_col1.cons().split(obj_types=[chunk_a_worker, chunk_a_worker], offsets=[0, 16], names=["MEM_L2_L1_A3_col1", "MEM_L2_L1_A4_col1"], placement=Tile(1, 1))
+    MEM_L2_L1_A5A6_col2 = of_in_a_col2.cons().split(obj_types=[chunk_a_worker, chunk_a_worker], offsets=[0, 16], names=["MEM_L2_L1_A5_col2", "MEM_L2_L1_A6_col2"], placement=Tile(2, 1))
+    MEM_L2_L1_A7A8_col3 = of_in_a_col3.cons().split(obj_types=[chunk_a_worker, chunk_a_worker], offsets=[0, 16], names=["MEM_L2_L1_A7_col3", "MEM_L2_L1_A8_col3"], placement=Tile(3, 1))
+    MEM_L2_L1_B1B2_col0 = of_in_b_col0.cons().split(obj_types=[chunk_b_worker, chunk_b_worker], offsets=[0, 16], names=["MEM_L2_L1_B1_col0", "MEM_L2_L1_B2_col0"], placement=Tile(0, 1))
+    MEM_L2_L1_B3B4_col1 = of_in_b_col1.cons().split(obj_types=[chunk_b_worker, chunk_b_worker], offsets=[0, 16], names=["MEM_L2_L1_B3_col1", "MEM_L2_L1_B4_col1"], placement=Tile(1, 1))
+    MEM_L2_L1_B5B6_col2 = of_in_b_col2.cons().split(obj_types=[chunk_b_worker, chunk_b_worker], offsets=[0, 16], names=["MEM_L2_L1_B5_col2", "MEM_L2_L1_B6_col2"], placement=Tile(2, 1))
+    MEM_L2_L1_B7B8_col3 = of_in_b_col3.cons().split(obj_types=[chunk_b_worker, chunk_b_worker], offsets=[0, 16], names=["MEM_L2_L1_B7_col3", "MEM_L2_L1_B8_col3"], placement=Tile(3, 1))
+    MEM_L1_L2_D1D2_col0 = of_out_d_col0.prod().join(obj_types=[chunk_d_worker, chunk_d_worker], names=["MEM_L1_L2_D1_col0", "MEM_L1_L2_D2_col0"], placement=Tile(0, 1), offsets=[0, 16])
+    MEM_L1_L2_D3D4_col1 = of_out_d_col1.prod().join(obj_types=[chunk_d_worker, chunk_d_worker], names=["MEM_L1_L2_D3_col1", "MEM_L1_L2_D4_col1"], placement=Tile(1, 1), offsets=[0, 16])
+    MEM_L1_L2_D5D6_col2 = of_out_d_col2.prod().join(obj_types=[chunk_d_worker, chunk_d_worker], names=["MEM_L1_L2_D5_col2", "MEM_L1_L2_D6_col2"], placement=Tile(2, 1), offsets=[0, 16])
+    MEM_L1_L2_D7D8_col3 = of_out_d_col3.prod().join(obj_types=[chunk_d_worker, chunk_d_worker], names=["MEM_L1_L2_D7_col3", "MEM_L1_L2_D8_col3"], placement=Tile(3, 1), offsets=[0, 16])
 
     #Define kernels here... ------------------------------------------------\/
     externalfunc1 = ExternalFunction(
@@ -142,7 +144,7 @@ def main():
     A = iron.arange(data_size, dtype=bfloat16, device="npu")
     B = iron.arange(data_size, dtype=bfloat16, device="npu")
     D = iron.zeros(data_size, dtype=bfloat16, device="npu")
-    add_activate_hlir_example_jit(A, B, D)
+    add_activate_test_jit(A, B, D)
 
     print(D)
 
