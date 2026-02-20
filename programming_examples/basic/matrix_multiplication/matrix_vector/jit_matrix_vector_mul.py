@@ -13,7 +13,7 @@ from aie.iron.placers import SequentialPlacer
 from aie.iron import ExternalFunction, jit
 from aie.iron.controlflow import range_
 from aie.iron.device import Tile
-from aie.helpers.taplib import TensorAccessPattern
+from aie.helpers.taplib import TensorTiler2D
 import aie.iron as iron
 
 
@@ -38,10 +38,14 @@ def matrix_vector_mul_jit(inputA, inputB, outputC):
     A_mem_ty = np.ndarray[(n_cores * m * k,), np.dtype[np.int16]]   # 4096 int16
     C_mem_ty = np.ndarray[(n_cores * m,), np.dtype[np.int32]]       # 128 int32
 
-    # Host buffer types
-    A_ty = np.ndarray[(M * K,), np.dtype[np.int16]]
-    B_ty = np.ndarray[(rows_per_core * K_div_k * k,), np.dtype[np.int16]]
-    C_ty = np.ndarray[(M,), np.dtype[np.int32]]
+    # Fifo element counts
+    n_fifo_elems = rows_per_core * K_div_k  # 16
+    A_elem_size = n_cores * m * k           # 4096 int16 per fifo element
+
+    # Host buffer types (2D for TensorTiler2D compatibility)
+    A_ty = np.ndarray[(n_fifo_elems, A_elem_size), np.dtype[np.int16]]
+    B_ty = np.ndarray[(1, K), np.dtype[np.int16]]
+    C_ty = np.ndarray[(1, M), np.dtype[np.int32]]
 
     # External kernel function
     matvec = ExternalFunction(
@@ -100,46 +104,29 @@ def matrix_vector_mul_jit(inputA, inputB, outputC):
     worker2 = Worker(core_fn, fn_args=[a_fifos[2].cons(), B_fwd.cons(), c_fifos[2].prod(), matvec], placement=Tile(0, 4))
     worker3 = Worker(core_fn, fn_args=[a_fifos[3].cons(), B_fwd.cons(), c_fifos[3].prod(), matvec], placement=Tile(0, 5))
 
-    # Fifo element counts
-    n_fifo_elems = rows_per_core * K_div_k  # 16
-    A_elem_size = n_cores * m * k           # 4096 int16 per fifo element
+    # --- Tensor access patterns ---
+    a_tap = TensorTiler2D.group_tiler(
+        (n_fifo_elems, A_elem_size), (1, 512),
+        (n_fifo_elems, A_elem_size // 512),
+        prune_step=False,
+    )[0]
+    b_tap = TensorTiler2D.group_tiler(
+        (1, K), (1, k), (1, K_div_k),
+        pattern_repeat=rows_per_core,
+        prune_step=False,
+    )[0]
+    c_tap = TensorTiler2D.group_tiler(
+        (1, M), (1, n_cores * m), (1, rows_per_core),
+        prune_step=False,
+    )[0]
 
     # --- Runtime ---
     rt = Runtime()
     with rt.sequence(A_ty, B_ty, C_ty) as (a_in, b_in, c_out):
         rt.start(worker0, worker1, worker2, worker3)
-        # A_elem_size=4096 exceeds BD max dim size of 1023, so split: 4096 = 8 * 512
-        rt.fill(
-            in_fifo=A_fifo.prod(), source=a_in,
-            tap=TensorAccessPattern(
-                tensor_dims=[M * K],
-                offset=0,
-                sizes=[n_fifo_elems, 8, 512],
-                strides=[A_elem_size, 512, 1],
-            ),
-            placement=Tile(0, 0),
-        )
-        # B: no replication needed, forward broadcasts to all compute tiles
-        rt.fill(
-            in_fifo=B_fifo.prod(), source=b_in,
-            tap=TensorAccessPattern(
-                tensor_dims=[rows_per_core * K_div_k * k],
-                offset=0,
-                sizes=[n_fifo_elems, k],
-                strides=[k, 1],
-            ),
-            placement=Tile(1, 0),
-        )
-        rt.drain(
-            out_fifo=C_fifo.cons(), dest=c_out, wait=True,
-            tap=TensorAccessPattern(
-                tensor_dims=[M],
-                offset=0,
-                sizes=[rows_per_core, n_cores * m],
-                strides=[n_cores * m, 1],
-            ),
-            placement=Tile(2, 0),
-        )
+        rt.fill(in_fifo=A_fifo.prod(), source=a_in, tap=a_tap, placement=Tile(0, 0))
+        rt.fill(in_fifo=B_fifo.prod(), source=b_in, tap=b_tap, placement=Tile(1, 0))
+        rt.drain(out_fifo=C_fifo.cons(), dest=c_out, tap=c_tap, wait=True, placement=Tile(2, 0))
 
     return Program(iron.get_current_device(), rt).resolve_program(SequentialPlacer())
 
@@ -181,19 +168,15 @@ def main():
 
     A_buf = prepare_A(A_data)
 
-    # --- Prepare B host buffer ---
-    # B is forwarded (broadcast) to all compute tiles, so no replication needed.
-    # Just repeat the full vector for each row block iteration.
-
-    B_buf = np.tile(b_data, rows_per_core)
-
     # --- Create device tensors ---
     inputA = iron.zeros(len(A_buf), dtype=np.int16, device="npu")
     inputA.data[:] = A_buf
     inputA._sync_to_device()
 
-    inputB = iron.zeros(len(B_buf), dtype=np.int16, device="npu")
-    inputB.data[:] = B_buf
+    # B uses pattern_repeat in the TAP to re-read the same vector for each
+    # row block iteration, so no host-side replication is needed.
+    inputB = iron.zeros(K, dtype=np.int16, device="npu")
+    inputB.data[:] = b_data
     inputB._sync_to_device()
 
     outputC = iron.zeros(M, dtype=np.int32, device="npu")
