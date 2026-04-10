@@ -7,7 +7,8 @@ from ml_dtypes import bfloat16
 from aie.iron import Program, Runtime, Worker, ObjectFifo
 from aie.iron.placers import SequentialPlacer
 from aie.iron.device.tile import AnyComputeTile
-from aie.iron import ExternalFunction, jit
+from aie.iron import Kernel
+import os
 from aie.iron.dataflow import ObjectFifoLink
 from aie.iron.device import Tile
 from aie.iron.device import NPU1Col1, NPU2Col1, XCVC1902
@@ -43,7 +44,6 @@ def add_activate_test_jit(A, B, D):
     of_in_b_col1 = ObjectFifo(obj_type=chunk_ty, depth=2, name="of_in_b_col1")
     of_in_b_col2 = ObjectFifo(obj_type=chunk_ty, depth=2, name="of_in_b_col2")
     of_in_b_col3 = ObjectFifo(obj_type=chunk_ty, depth=2, name="of_in_b_col3")
-    of_inter_1 = ObjectFifo(obj_type=worker_chunk_ty, depth=2, name="of_inter_1")
     of_inter_2 = ObjectFifo(obj_type=worker_chunk_ty, depth=2, name="of_inter_2")
     of_inter_3 = ObjectFifo(obj_type=worker_chunk_ty, depth=2, name="of_inter_3")
     of_inter_4 = ObjectFifo(obj_type=worker_chunk_ty, depth=2, name="of_inter_4")
@@ -69,13 +69,11 @@ def add_activate_test_jit(A, B, D):
     MEM_L1_L2_D7D8_col3 = of_out_d_col3.prod().join(obj_types=[chunk_d_worker, chunk_d_worker], names=["MEM_L1_L2_D7_col3", "MEM_L1_L2_D8_col3"], placement=Tile(3, 1), offsets=[0, 16])
 
     #Define kernels here... ------------------------------------------------\/
-    externalfunc1 = ExternalFunction(
-        name="eltwise_add_bf16_scalar", source_file="/scratch/IRONSmithTesting/mlir-aie/aie_kernels/aie2/add.cc", arg_types=[worker_chunk_ty, worker_chunk_ty, worker_chunk_ty], include_dirs=["/scratch/IRONSmithTesting/mlir-aie/aie_kernels", "/scratch/IRONSmithTesting/mlir-aie/aie_runtime_lib/AIE2"]
-    )
+    _build_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build")
+    _add_relu_archive = os.path.join(_build_dir, "add_relu.a")
 
-    externalfunc2 = ExternalFunction(
-        name="bf16_relu", source_file="/scratch/IRONSmithTesting/mlir-aie/aie_kernels/aie2/relu.cc", arg_types=[worker_chunk_ty, worker_chunk_ty], include_dirs=["/scratch/IRONSmithTesting/mlir-aie/aie_kernels", "/scratch/IRONSmithTesting/mlir-aie/aie_runtime_lib/AIE2"]
-    )
+    externalfunc1 = Kernel("eltwise_add_bf16_scalar", _add_relu_archive, [worker_chunk_ty, worker_chunk_ty, worker_chunk_ty])
+    externalfunc2 = Kernel("bf16_relu", _add_relu_archive, [worker_chunk_ty, worker_chunk_ty])
 
     # core_fn here:
     def corefunc1(kernel, inputA, inputB, outputC):
@@ -94,9 +92,19 @@ def add_activate_test_jit(A, B, D):
             inputC.release(1)
             outputD.release(1)
 
+    def corefunc3(kernel1, kernel2, inputA, inputB, outputC):
+        elementA = inputA.acquire(1)
+        elementB = inputB.acquire(1)
+        elementC = outputC.acquire(1)
+        kernel1(elementA, elementB, elementC)
+        kernel2(elementC, elementC)
+        inputA.release(1)
+        inputB.release(1)
+        outputC.release(1)
+
     #Workers defined here:
     Workers = []
-    worker_add_col0_w0 = Worker(core_fn=corefunc1, fn_args=[externalfunc1, MEM_L2_L1_A1A2_col0[0].cons(), MEM_L2_L1_B1B2_col0[0].cons(), of_inter_1.prod()], placement=Tile(0, 5))
+    worker_fused_col0_w0 = Worker(core_fn=corefunc3, fn_args=[externalfunc1, externalfunc2, MEM_L2_L1_A1A2_col0[0].cons(), MEM_L2_L1_B1B2_col0[0].cons(), MEM_L1_L2_D1D2_col0[0].prod()], placement=Tile(0, 5))
     worker_add_col0_w1 = Worker(core_fn=corefunc1, fn_args=[externalfunc1, MEM_L2_L1_A1A2_col0[1].cons(), MEM_L2_L1_B1B2_col0[1].cons(), of_inter_2.prod()], placement=Tile(0, 3))
     worker_add_col1_w0 = Worker(core_fn=corefunc1, fn_args=[externalfunc1, MEM_L2_L1_A3A4_col1[0].cons(), MEM_L2_L1_B3B4_col1[0].cons(), of_inter_3.prod()], placement=Tile(1, 5))
     worker_add_col1_w1 = Worker(core_fn=corefunc1, fn_args=[externalfunc1, MEM_L2_L1_A3A4_col1[1].cons(), MEM_L2_L1_B3B4_col1[1].cons(), of_inter_4.prod()], placement=Tile(1, 3))
@@ -104,7 +112,6 @@ def add_activate_test_jit(A, B, D):
     worker_add_col2_w1 = Worker(core_fn=corefunc1, fn_args=[externalfunc1, MEM_L2_L1_A5A6_col2[1].cons(), MEM_L2_L1_B5B6_col2[1].cons(), of_inter_6.prod()], placement=Tile(2, 3))
     worker_add_col3_w0 = Worker(core_fn=corefunc1, fn_args=[externalfunc1, MEM_L2_L1_A7A8_col3[0].cons(), MEM_L2_L1_B7B8_col3[0].cons(), of_inter_7.prod()], placement=Tile(3, 5))
     worker_add_col3_w1 = Worker(core_fn=corefunc1, fn_args=[externalfunc1, MEM_L2_L1_A7A8_col3[1].cons(), MEM_L2_L1_B7B8_col3[1].cons(), of_inter_8.prod()], placement=Tile(3, 3))
-    worker_relu_col0_w0 = Worker(core_fn=corefunc2, fn_args=[externalfunc2, of_inter_1.cons(), MEM_L1_L2_D1D2_col0[0].prod()], placement=Tile(0, 4))
     worker_relu_col0_w1 = Worker(core_fn=corefunc2, fn_args=[externalfunc2, of_inter_2.cons(), MEM_L1_L2_D1D2_col0[1].prod()], placement=Tile(0, 2))
     worker_relu_col1_w0 = Worker(core_fn=corefunc2, fn_args=[externalfunc2, of_inter_3.cons(), MEM_L1_L2_D3D4_col1[0].prod()], placement=Tile(1, 4))
     worker_relu_col1_w1 = Worker(core_fn=corefunc2, fn_args=[externalfunc2, of_inter_4.cons(), MEM_L1_L2_D3D4_col1[1].prod()], placement=Tile(1, 2))
@@ -113,7 +120,7 @@ def add_activate_test_jit(A, B, D):
     worker_relu_col3_w0 = Worker(core_fn=corefunc2, fn_args=[externalfunc2, of_inter_7.cons(), MEM_L1_L2_D7D8_col3[0].prod()], placement=Tile(3, 4))
     worker_relu_col3_w1 = Worker(core_fn=corefunc2, fn_args=[externalfunc2, of_inter_8.cons(), MEM_L1_L2_D7D8_col3[1].prod()], placement=Tile(3, 2))
 
-    Workers = [worker_add_col0_w0, worker_add_col0_w1, worker_add_col1_w0, worker_add_col1_w1, worker_add_col2_w0, worker_add_col2_w1, worker_add_col3_w0, worker_add_col3_w1, worker_relu_col0_w0, worker_relu_col0_w1, worker_relu_col1_w0, worker_relu_col1_w1, worker_relu_col2_w0, worker_relu_col2_w1, worker_relu_col3_w0, worker_relu_col3_w1]
+    Workers = [worker_fused_col0_w0, worker_add_col0_w1, worker_add_col1_w0, worker_add_col1_w1, worker_add_col2_w0, worker_add_col2_w1, worker_add_col3_w0, worker_add_col3_w1, worker_relu_col0_w1, worker_relu_col1_w0, worker_relu_col1_w1, worker_relu_col2_w0, worker_relu_col2_w1, worker_relu_col3_w0, worker_relu_col3_w1]
 
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()

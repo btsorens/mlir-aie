@@ -55,6 +55,25 @@ build/kernels.a: build/exp.o
 	ar rvs $@ $+
 endif
 
+build/add.o: ${srcdir}/../../../aie_kernels/aie2/add.cc
+	mkdir -p ${@D}
+ifeq ($(devicename),npu)
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2_FLAGS} -I${aie2_runtime_dir} -I${srcdir}/../../../aie_kernels -c $< -o ${@F}
+else
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -I${srcdir}/../../../aie_kernels -c $< -o ${@F}
+endif
+
+build/relu.o: ${srcdir}/../../../aie_kernels/aie2/relu.cc
+	mkdir -p ${@D}
+ifeq ($(devicename),npu)
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2_FLAGS} -I${aie2_runtime_dir} -I${srcdir}/../../../aie_kernels -c $< -o ${@F}
+else
+	cd ${@D} && ${PEANO_INSTALL_DIR}/bin/clang++ ${PEANOWRAP2P_FLAGS} -I${srcdir}/../../../aie_kernels -c $< -o ${@F}
+endif
+
+build/add_relu.a: build/add.o build/relu.o
+	ar rvs $@ $+
+
 build/aie.mlir: ${srcdir}/${aie_py_src}
 	mkdir -p ${@D}
 	python3 $< ${devicename} ${col} > $@

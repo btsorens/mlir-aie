@@ -60,14 +60,16 @@ def matrix_vector_mul_test_jit(inputA, inputB, outputC):
 
     # core_fn here:
     def core_fn(a_in, b_in, c_out, matvec):
-            for _ in range_(K // k):
-                elem_out = c_out.acquire(1)
-                elem_a = a_in.acquire(1)
-                elem_b = b_in.acquire(1)
-                matvec(elem_a, elem_b, elem_out)
-                a_in.release(1)
-                b_in.release(1)
-                c_out.release(1)
+        elem_out = c_out.acquire(1)
+        for i in range_(32):
+            elem_out[i] = 0
+        for _ in range_(K // k):
+            elem_a = a_in.acquire(1)
+            elem_b = b_in.acquire(1)
+            matvec(elem_a, elem_b, elem_out)
+            a_in.release(1)
+            b_in.release(1)
+        c_out.release(1)
 
     #Workers defined here:
     Workers = []
@@ -93,28 +95,6 @@ def matrix_vector_mul_test_jit(inputA, inputB, outputC):
     return my_program.resolve_program(SequentialPlacer())
 
 
-def main():
-    M = 256
-    K = 256
-    m = 32
-    k = 32
-    n_cores = 4
-    M_div_m = M // m
-    K_div_k = K // k
-    rows_per_core = M_div_m // n_cores
-    n_fifo_elems = rows_per_core * K_div_k
-    A_elem_size = n_cores * m * k
-    inputA = iron.arange(n_fifo_elems, dtype=np.int16, device="npu")
-    inputB = iron.arange(n_fifo_elems, dtype=np.int16, device="npu")
-    outputC = iron.zeros(n_fifo_elems, dtype=np.int16, device="npu")
-    matrix_vector_mul_test_jit(inputA, inputB, outputC)
-
-
-
-if __name__ == "__main__":
-    main()
-
-
 # def main():
 #     M = 256
 #     K = 256
@@ -126,61 +106,83 @@ if __name__ == "__main__":
 #     rows_per_core = M_div_m // n_cores
 #     n_fifo_elems = rows_per_core * K_div_k
 #     A_elem_size = n_cores * m * k
-
-#     # Create input data
-#     A_data = np.arange(M * K, dtype=np.int16).reshape(M, K)
-#     b_data = np.arange(K, dtype=np.int16)
-
-#     # Prepare A host buffer: interleave tiles for all cores per fifo element,
-#     # with 32-bit word transposition required by matvec_vectorized.
-#     def prepare_A(A_data):
-#         buf = []
-#         for rb_group in range(rows_per_core):
-#             for cb in range(K_div_k):
-#                 for core in range(n_cores):
-#                     rb = core + rb_group * n_cores
-#                     tile = A_data[rb * m:(rb + 1) * m, cb * k:(cb + 1) * k]
-#                     tile_t = tile.reshape(m, k // 2, 2).transpose(1, 0, 2).reshape(-1)
-#                     buf.append(tile_t)
-#         return np.concatenate(buf)
-
-#     A_buf = prepare_A(A_data)
-
-#     # Create device tensors
-#     inputA = iron.zeros(len(A_buf), dtype=np.int16, device="npu")
-#     inputA.data[:] = A_buf
-#     inputA._sync_to_device()
-
-#     inputB = iron.arange(K, dtype=np.int16, device="npu")
-
-#     outputC = iron.zeros(M, dtype=np.int32, device="npu")
-
+#     inputA = iron.arange(n_fifo_elems, dtype=np.int16, device="npu")
+#     inputB = iron.arange(n_fifo_elems, dtype=np.int16, device="npu")
+#     outputC = iron.zeros(n_fifo_elems, dtype=np.int16, device="npu")
 #     matrix_vector_mul_test_jit(inputA, inputB, outputC)
-
-#     print(outputC)
-
-#     # Validation against numpy reference
-#     expected = A_data.astype(np.int32) @ b_data.astype(np.int32)
-#     actual = np.asarray(outputC, dtype=np.int32)
-
-#     print("\nSample element-by-element comparison (first 10):")
-#     for i in range(min(10, M)):
-#         print(f"  Row {i}: Expected = {expected[i]} : Received = {actual[i]}")
-
-#     mismatches = np.where(actual != expected)[0]
-
-#     print(f"\nValidation results:")
-#     print(f"  Elements tested: {M}")
-
-#     if len(mismatches) == 0:
-#         print(f"  Status: PASSED - All {M} values match exactly")
-#     else:
-#         print(f"  Status: FAILED - {len(mismatches)} mismatches found")
-#         print(f"\nFirst few mismatches:")
-#         for i, idx in enumerate(mismatches[:5]):
-#             print(f"  Row {idx}: actual={actual[idx]}, expected={expected[idx]}")
 
 
 
 # if __name__ == "__main__":
 #     main()
+
+
+def main():
+    M = 256
+    K = 256
+    m = 32
+    k = 32
+    n_cores = 4
+    M_div_m = M // m
+    K_div_k = K // k
+    rows_per_core = M_div_m // n_cores
+    n_fifo_elems = rows_per_core * K_div_k
+    A_elem_size = n_cores * m * k
+
+    # Create input data
+    A_data = np.arange(M * K, dtype=np.int16).reshape(M, K)
+    b_data = np.arange(K, dtype=np.int16)
+
+    # Prepare A host buffer: interleave tiles for all cores per fifo element,
+    # with 32-bit word transposition required by matvec_vectorized.
+    def prepare_A(A_data):
+        buf = []
+        for rb_group in range(rows_per_core):
+            for cb in range(K_div_k):
+                for core in range(n_cores):
+                    rb = core + rb_group * n_cores
+                    tile = A_data[rb * m:(rb + 1) * m, cb * k:(cb + 1) * k]
+                    tile_t = tile.reshape(m, k // 2, 2).transpose(1, 0, 2).reshape(-1)
+                    buf.append(tile_t)
+        return np.concatenate(buf)
+
+    A_buf = prepare_A(A_data)
+
+    # Create device tensors
+    inputA = iron.zeros(len(A_buf), dtype=np.int16, device="npu")
+    inputA.data[:] = A_buf
+    inputA._sync_to_device()
+
+    inputB = iron.arange(K, dtype=np.int16, device="npu")
+
+    outputC = iron.zeros(M, dtype=np.int32, device="npu")
+
+    matrix_vector_mul_test_jit(inputA, inputB, outputC)
+
+    print(outputC)
+
+    # Validation against numpy reference
+    expected = A_data.astype(np.int32) @ b_data.astype(np.int32)
+    actual = np.asarray(outputC, dtype=np.int32)
+
+    print("\nSample element-by-element comparison (first 10):")
+    for i in range(min(10, M)):
+        print(f"  Row {i}: Expected = {expected[i]} : Received = {actual[i]}")
+
+    mismatches = np.where(actual != expected)[0]
+
+    print(f"\nValidation results:")
+    print(f"  Elements tested: {M}")
+
+    if len(mismatches) == 0:
+        print(f"  Status: PASSED - All {M} values match exactly")
+    else:
+        print(f"  Status: FAILED - {len(mismatches)} mismatches found")
+        print(f"\nFirst few mismatches:")
+        for i, idx in enumerate(mismatches[:5]):
+            print(f"  Row {idx}: actual={actual[idx]}, expected={expected[idx]}")
+
+
+
+if __name__ == "__main__":
+    main()
