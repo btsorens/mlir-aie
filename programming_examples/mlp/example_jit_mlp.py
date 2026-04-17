@@ -1,10 +1,10 @@
 # gui_design.py -*- Python -*-
 
 
-import os
 import numpy as np
 from ml_dtypes import bfloat16
 
+import os
 from aie.iron import Program, Runtime, Worker, ObjectFifo
 from aie.iron.placers import SequentialPlacer
 from aie.iron.device.tile import AnyComputeTile
@@ -20,88 +20,95 @@ from aie.helpers.taplib import TensorAccessPattern
 @iron.jit(is_placed=False)
 def gui_design_jit(input_activation, weight_layer0, weight_layer1, weight_layer2, weight_layer3, output_activation):
     # Tensor Types
-    type_int16_256 = np.ndarray[(256,), np.dtype[np.int16]]
-
-    type_int16_64 = np.ndarray[(64,), np.dtype[np.int16]]
-    type_int16_256x256 = np.ndarray[(256, 256), np.dtype[np.int16]]
+    # Kernel dimensions: DIM_M=64, DIM_K=64, DIM_N=16
+    # Per tile: A=64*64=4096, B=64*16=1024, C=64*16=1024
+    # 4 workers per column each handle N/4=16 output features → full layer N=64
+    type_int16_4096 = np.ndarray[(4096,), np.dtype[np.int16]]
+    type_int16_1024 = np.ndarray[(1024,), np.dtype[np.int16]]
+    type_int16_4096_2d = np.ndarray[(64, 64), np.dtype[np.int16]]
 
     # Data Movement
     # Object Fifos
-    input_activation_fifo = ObjectFifo(obj_type=type_int16_256, depth=2, name="input_activation_fifo")
-    inter_activation_fifo1 = ObjectFifo(obj_type=type_int16_256, depth=2, name="inter_activation_fifo1")
-    weights_col0_fifo = ObjectFifo(obj_type=type_int16_256, depth=2, name="weights_col0_fifo")
-    weights_col1_fifo = ObjectFifo(obj_type=type_int16_256, depth=2, name="weights_col1_fifo")
-    weights_col2_fifo = ObjectFifo(obj_type=type_int16_256, depth=2, name="weights_col2_fifo")
-    weights_col3_fifo = ObjectFifo(obj_type=type_int16_256, depth=2, name="weights_col3_fifo")
-    output_activation_fifo = ObjectFifo(obj_type=type_int16_256, depth=2, name="output_activation_fifo")
-    inter_activation_fifo2 = ObjectFifo(obj_type=type_int16_256, depth=2, name="inter_activation_fifo2")
-    inter_activation_fifo3 = ObjectFifo(obj_type=type_int16_256, depth=2, name="inter_activation_fifo3")
-    # Splits
-    weight_tile_split_col0 = weights_col0_fifo.cons().split(names=["weight_tile_split_col0_out1", "weight_tile_split_col0_out2", "weight_tile_split_col0_out3", "weight_tile_split_col0_out4"], obj_types=[type_int16_64, type_int16_64, type_int16_64, type_int16_64], offsets=[0, 64, 128, 192], placement=Tile(0, 1))
-    weight_tile_split_col1 = weights_col1_fifo.cons().split(names=["weight_tile_split_col1_out1", "weight_tile_split_col1_out2", "weight_tile_split_col1_out3", "weight_tile_split_col1_out4"], obj_types=[type_int16_64, type_int16_64, type_int16_64, type_int16_64], offsets=[0, 64, 128, 192], placement=Tile(1, 1))
-    weight_tile_split_col2 = weights_col2_fifo.cons().split(names=["weight_tile_split_col2_out1", "weight_tile_split_col2_out2", "weight_tile_split_col2_out3", "weight_tile_split_col2_out4"], obj_types=[type_int16_64, type_int16_64, type_int16_64, type_int16_64], offsets=[0, 64, 128, 192], placement=Tile(2, 1))
-    weight_tile_split_col3 = weights_col3_fifo.cons().split(names=["weight_tile_split_col3_out1", "weight_tile_split_col3_out2", "weight_tile_split_col3_out3", "weight_tile_split_col3_out4"], obj_types=[type_int16_64, type_int16_64, type_int16_64, type_int16_64], offsets=[0, 64, 128, 192], placement=Tile(3, 1))
-    # Joins
-    activation_tile_join_col0 = inter_activation_fifo1.prod().join(names=["activation_tile_join_col0_in1", "activation_tile_join_col0_in2", "activation_tile_join_col0_in3", "activation_tile_join_col0_in4"], obj_types=[type_int16_64, type_int16_64, type_int16_64, type_int16_64], offsets=[0, 64, 128, 192], placement=Tile(0, 1))
-    activation_tile_join_col1 = inter_activation_fifo2.prod().join(names=["activation_tile_join_col1_in1", "activation_tile_join_col1_in2", "activation_tile_join_col1_in3", "activation_tile_join_col1_in4"], obj_types=[type_int16_64, type_int16_64, type_int16_64, type_int16_64], offsets=[0, 64, 128, 192], placement=Tile(1, 1))
-    activation_tile_join_col2 = inter_activation_fifo3.prod().join(names=["activation_tile_join_col2_in1", "activation_tile_join_col2_in2", "activation_tile_join_col2_in3", "activation_tile_join_col2_in4"], obj_types=[type_int16_64, type_int16_64, type_int16_64, type_int16_64], offsets=[0, 64, 128, 192], placement=Tile(2, 1))
-    activation_tile_join_col3 = output_activation_fifo.prod().join(names=["activation_tile_join_col3_in1", "activation_tile_join_col3_in2", "activation_tile_join_col3_in3", "activation_tile_join_col3_in4"], obj_types=[type_int16_64, type_int16_64, type_int16_64, type_int16_64], offsets=[0, 64, 128, 192], placement=Tile(3, 1))
+    input_activation_fifo = ObjectFifo(obj_type=type_int16_4096, depth=2, name="input_activation_fifo")
+    inter_activation_fifo1 = ObjectFifo(obj_type=type_int16_4096, depth=2, name="inter_activation_fifo1")
+    weights_col0_fifo = ObjectFifo(obj_type=type_int16_4096, depth=2, name="weights_col0_fifo")
+    weights_col1_fifo = ObjectFifo(obj_type=type_int16_4096, depth=2, name="weights_col1_fifo")
+    weights_col2_fifo = ObjectFifo(obj_type=type_int16_4096, depth=2, name="weights_col2_fifo")
+    weights_col3_fifo = ObjectFifo(obj_type=type_int16_4096, depth=2, name="weights_col3_fifo")
+    output_activation_fifo = ObjectFifo(obj_type=type_int16_4096, depth=2, name="output_activation_fifo")
+    inter_activation_fifo2 = ObjectFifo(obj_type=type_int16_4096, depth=2, name="inter_activation_fifo2")
+    inter_activation_fifo3 = ObjectFifo(obj_type=type_int16_4096, depth=2, name="inter_activation_fifo3")
+    # Splits: 4096-element weight block → 4 × 1024-element tiles
+    weight_tile_split_col0 = weights_col0_fifo.cons().split(names=["weight_tile_split_col0_out1", "weight_tile_split_col0_out2", "weight_tile_split_col0_out3", "weight_tile_split_col0_out4"], obj_types=[type_int16_1024, type_int16_1024, type_int16_1024, type_int16_1024], offsets=[0, 1024, 2048, 3072], placement=Tile(0, 1))
+    weight_tile_split_col1 = weights_col1_fifo.cons().split(names=["weight_tile_split_col1_out1", "weight_tile_split_col1_out2", "weight_tile_split_col1_out3", "weight_tile_split_col1_out4"], obj_types=[type_int16_1024, type_int16_1024, type_int16_1024, type_int16_1024], offsets=[0, 1024, 2048, 3072], placement=Tile(1, 1))
+    weight_tile_split_col2 = weights_col2_fifo.cons().split(names=["weight_tile_split_col2_out1", "weight_tile_split_col2_out2", "weight_tile_split_col2_out3", "weight_tile_split_col2_out4"], obj_types=[type_int16_1024, type_int16_1024, type_int16_1024, type_int16_1024], offsets=[0, 1024, 2048, 3072], placement=Tile(2, 1))
+    weight_tile_split_col3 = weights_col3_fifo.cons().split(names=["weight_tile_split_col3_out1", "weight_tile_split_col3_out2", "weight_tile_split_col3_out3", "weight_tile_split_col3_out4"], obj_types=[type_int16_1024, type_int16_1024, type_int16_1024, type_int16_1024], offsets=[0, 1024, 2048, 3072], placement=Tile(3, 1))
+    # Joins: 4 × 1024-element output tiles → 4096-element activation block
+    activation_tile_join_col0 = inter_activation_fifo1.prod().join(names=["activation_tile_join_col0_in1", "activation_tile_join_col0_in2", "activation_tile_join_col0_in3", "activation_tile_join_col0_in4"], obj_types=[type_int16_1024, type_int16_1024, type_int16_1024, type_int16_1024], offsets=[0, 1024, 2048, 3072], placement=Tile(0, 1))
+    activation_tile_join_col1 = inter_activation_fifo2.prod().join(names=["activation_tile_join_col1_in1", "activation_tile_join_col1_in2", "activation_tile_join_col1_in3", "activation_tile_join_col1_in4"], obj_types=[type_int16_1024, type_int16_1024, type_int16_1024, type_int16_1024], offsets=[0, 1024, 2048, 3072], placement=Tile(1, 1))
+    activation_tile_join_col2 = inter_activation_fifo3.prod().join(names=["activation_tile_join_col2_in1", "activation_tile_join_col2_in2", "activation_tile_join_col2_in3", "activation_tile_join_col2_in4"], obj_types=[type_int16_1024, type_int16_1024, type_int16_1024, type_int16_1024], offsets=[0, 1024, 2048, 3072], placement=Tile(2, 1))
+    activation_tile_join_col3 = output_activation_fifo.prod().join(names=["activation_tile_join_col3_in1", "activation_tile_join_col3_in2", "activation_tile_join_col3_in3", "activation_tile_join_col3_in4"], obj_types=[type_int16_1024, type_int16_1024, type_int16_1024, type_int16_1024], offsets=[0, 1024, 2048, 3072], placement=Tile(3, 1))
     # Broadcasts
     input_activation_col0_fifo = input_activation_fifo.cons().forward(placement=Tile(0, 1))
 
     # Compute Kernels
     build_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build")
     mm_archive = os.path.join(build_dir, "mm.a")
-    kernel_zero_i16      = Kernel("zero_i16",       mm_archive, [type_int16_64])
-    kernel_matmul_i16_i16 = Kernel("matmul_i16_i16", mm_archive, [type_int16_256, type_int16_64, type_int16_64])
-    kernel_relu_i16       = Kernel("relu_i16",       mm_archive, [type_int16_64])
+    kernel_matmul_i16_i16 = Kernel("matmul_i16_i16", mm_archive, [type_int16_4096, type_int16_1024, type_int16_1024])
+
+    kernel_relu_i16 = Kernel("relu_i16", mm_archive, [type_int16_1024])
+
+    kernel_zero_i16 = Kernel("zero_i16", mm_archive, [type_int16_1024])
+
+    kernel_softmax_i16 = Kernel("softmax_i16", mm_archive, [type_int16_1024])
 
     # Core Body Functions
-    def core_shared_matmul_relu(zero, matmul, relu, in0, in1, out0):
-        buf_in0  = in0.acquire(1)
-        buf_in1  = in1.acquire(1)
+    def core_shared_matmul_relu(Kernel1, Kernel2, Kernel3, in0, in1, out0):
+        buf_in0 = in0.acquire(1)
+        buf_in1 = in1.acquire(1)
         buf_out0 = out0.acquire(1)
-        zero(buf_out0)
-        matmul(buf_in0, buf_in1, buf_out0)
-        relu(buf_out0)
+        Kernel3(buf_out0)
+        Kernel1(buf_in0, buf_in1, buf_out0)
+        Kernel2(buf_out0)
         in0.release(1)
         in1.release(1)
         out0.release(1)
 
-    def core_shared_matmul_final(zero, matmul, in0, in1, out0):
-        buf_in0  = in0.acquire(1)
-        buf_in1  = in1.acquire(1)
+    def core_shared_matmul_softmax(Kernel1, Kernel2, Kernel3, in0, in1, out0):
+        buf_in0 = in0.acquire(1)
+        buf_in1 = in1.acquire(1)
         buf_out0 = out0.acquire(1)
-        zero(buf_out0)
-        matmul(buf_in0, buf_in1, buf_out0)
+        Kernel2(buf_out0)
+        Kernel1(buf_in0, buf_in1, buf_out0)
+        Kernel3(buf_out0)
         in0.release(1)
         in1.release(1)
         out0.release(1)
 
     # Workers
     Workers = []
-    worker_aie0_2 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, kernel_relu_i16, input_activation_col0_fifo.cons(), weight_tile_split_col0[0].cons(), activation_tile_join_col0[0].prod()], placement=Tile(0, 2))
-    worker_aie1_2 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, kernel_relu_i16, inter_activation_fifo1.cons(), weight_tile_split_col1[0].cons(), activation_tile_join_col1[0].prod()], placement=Tile(1, 2))
-    worker_aie2_2 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, kernel_relu_i16, inter_activation_fifo2.cons(), weight_tile_split_col2[0].cons(), activation_tile_join_col2[0].prod()], placement=Tile(2, 2))
-    worker_aie3_2 = Worker(core_fn=core_shared_matmul_final, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, inter_activation_fifo3.cons(), weight_tile_split_col3[0].cons(), activation_tile_join_col3[0].prod()], placement=Tile(3, 2))
-    worker_aie0_3 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, kernel_relu_i16, input_activation_col0_fifo.cons(), weight_tile_split_col0[1].cons(), activation_tile_join_col0[1].prod()], placement=Tile(0, 3))
-    worker_aie1_3 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, kernel_relu_i16, inter_activation_fifo1.cons(), weight_tile_split_col1[1].cons(), activation_tile_join_col1[1].prod()], placement=Tile(1, 3))
-    worker_aie2_3 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, kernel_relu_i16, inter_activation_fifo2.cons(), weight_tile_split_col2[1].cons(), activation_tile_join_col2[1].prod()], placement=Tile(2, 3))
-    worker_aie3_3 = Worker(core_fn=core_shared_matmul_final, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, inter_activation_fifo3.cons(), weight_tile_split_col3[1].cons(), activation_tile_join_col3[1].prod()], placement=Tile(3, 3))
-    worker_aie0_4 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, kernel_relu_i16, input_activation_col0_fifo.cons(), weight_tile_split_col0[2].cons(), activation_tile_join_col0[2].prod()], placement=Tile(0, 4))
-    worker_aie1_4 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, kernel_relu_i16, inter_activation_fifo1.cons(), weight_tile_split_col1[2].cons(), activation_tile_join_col1[2].prod()], placement=Tile(1, 4))
-    worker_aie2_4 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, kernel_relu_i16, inter_activation_fifo2.cons(), weight_tile_split_col2[2].cons(), activation_tile_join_col2[2].prod()], placement=Tile(2, 4))
-    worker_aie3_4 = Worker(core_fn=core_shared_matmul_final, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, inter_activation_fifo3.cons(), weight_tile_split_col3[2].cons(), activation_tile_join_col3[2].prod()], placement=Tile(3, 4))
-    worker_aie0_5 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, kernel_relu_i16, input_activation_col0_fifo.cons(), weight_tile_split_col0[3].cons(), activation_tile_join_col0[3].prod()], placement=Tile(0, 5))
-    worker_aie1_5 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, kernel_relu_i16, inter_activation_fifo1.cons(), weight_tile_split_col1[3].cons(), activation_tile_join_col1[3].prod()], placement=Tile(1, 5))
-    worker_aie2_5 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, kernel_relu_i16, inter_activation_fifo2.cons(), weight_tile_split_col2[3].cons(), activation_tile_join_col2[3].prod()], placement=Tile(2, 5))
-    worker_aie3_5 = Worker(core_fn=core_shared_matmul_final, fn_args=[kernel_zero_i16, kernel_matmul_i16_i16, inter_activation_fifo3.cons(), weight_tile_split_col3[3].cons(), activation_tile_join_col3[3].prod()], placement=Tile(3, 5))
+    worker_aie0_2 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_matmul_i16_i16, kernel_relu_i16, kernel_zero_i16, input_activation_col0_fifo.cons(), weight_tile_split_col0[0].cons(), activation_tile_join_col0[0].prod()], placement=Tile(0, 2))
+    worker_aie1_2 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_matmul_i16_i16, kernel_relu_i16, kernel_zero_i16, inter_activation_fifo1.cons(), weight_tile_split_col1[0].cons(), activation_tile_join_col1[0].prod()], placement=Tile(1, 2))
+    worker_aie2_2 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_matmul_i16_i16, kernel_relu_i16, kernel_zero_i16, inter_activation_fifo2.cons(), weight_tile_split_col2[0].cons(), activation_tile_join_col2[0].prod()], placement=Tile(2, 2))
+    worker_aie3_2 = Worker(core_fn=core_shared_matmul_softmax, fn_args=[kernel_matmul_i16_i16, kernel_zero_i16, kernel_softmax_i16, inter_activation_fifo3.cons(), weight_tile_split_col3[0].cons(), activation_tile_join_col3[0].prod()], placement=Tile(3, 2))
+    worker_aie0_3 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_matmul_i16_i16, kernel_relu_i16, kernel_zero_i16, input_activation_col0_fifo.cons(), weight_tile_split_col0[1].cons(), activation_tile_join_col0[1].prod()], placement=Tile(0, 3))
+    worker_aie1_3 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_matmul_i16_i16, kernel_relu_i16, kernel_zero_i16, inter_activation_fifo1.cons(), weight_tile_split_col1[1].cons(), activation_tile_join_col1[1].prod()], placement=Tile(1, 3))
+    worker_aie2_3 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_matmul_i16_i16, kernel_relu_i16, kernel_zero_i16, inter_activation_fifo2.cons(), weight_tile_split_col2[1].cons(), activation_tile_join_col2[1].prod()], placement=Tile(2, 3))
+    worker_aie3_3 = Worker(core_fn=core_shared_matmul_softmax, fn_args=[kernel_matmul_i16_i16, kernel_zero_i16, kernel_softmax_i16, inter_activation_fifo3.cons(), weight_tile_split_col3[1].cons(), activation_tile_join_col3[1].prod()], placement=Tile(3, 3))
+    worker_aie0_4 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_matmul_i16_i16, kernel_relu_i16, kernel_zero_i16, input_activation_col0_fifo.cons(), weight_tile_split_col0[2].cons(), activation_tile_join_col0[2].prod()], placement=Tile(0, 4))
+    worker_aie1_4 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_matmul_i16_i16, kernel_relu_i16, kernel_zero_i16, inter_activation_fifo1.cons(), weight_tile_split_col1[2].cons(), activation_tile_join_col1[2].prod()], placement=Tile(1, 4))
+    worker_aie2_4 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_matmul_i16_i16, kernel_relu_i16, kernel_zero_i16, inter_activation_fifo2.cons(), weight_tile_split_col2[2].cons(), activation_tile_join_col2[2].prod()], placement=Tile(2, 4))
+    worker_aie3_4 = Worker(core_fn=core_shared_matmul_softmax, fn_args=[kernel_matmul_i16_i16, kernel_zero_i16, kernel_softmax_i16, inter_activation_fifo3.cons(), weight_tile_split_col3[2].cons(), activation_tile_join_col3[2].prod()], placement=Tile(3, 4))
+    worker_aie0_5 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_matmul_i16_i16, kernel_relu_i16, kernel_zero_i16, input_activation_col0_fifo.cons(), weight_tile_split_col0[3].cons(), activation_tile_join_col0[3].prod()], placement=Tile(0, 5))
+    worker_aie1_5 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_matmul_i16_i16, kernel_relu_i16, kernel_zero_i16, inter_activation_fifo1.cons(), weight_tile_split_col1[3].cons(), activation_tile_join_col1[3].prod()], placement=Tile(1, 5))
+    worker_aie2_5 = Worker(core_fn=core_shared_matmul_relu, fn_args=[kernel_matmul_i16_i16, kernel_relu_i16, kernel_zero_i16, inter_activation_fifo2.cons(), weight_tile_split_col2[3].cons(), activation_tile_join_col2[3].prod()], placement=Tile(2, 5))
+    worker_aie3_5 = Worker(core_fn=core_shared_matmul_softmax, fn_args=[kernel_matmul_i16_i16, kernel_zero_i16, kernel_softmax_i16, inter_activation_fifo3.cons(), weight_tile_split_col3[3].cons(), activation_tile_join_col3[3].prod()], placement=Tile(3, 5))
 
     Workers = [worker_aie0_2, worker_aie1_2, worker_aie2_2, worker_aie3_2, worker_aie0_3, worker_aie1_3, worker_aie2_3, worker_aie3_3, worker_aie0_4, worker_aie1_4, worker_aie2_4, worker_aie3_4, worker_aie0_5, worker_aie1_5, worker_aie2_5, worker_aie3_5]
 
     # Runtime
     rt = Runtime()
-    with rt.sequence(type_int16_256x256, type_int16_256, type_int16_256, type_int16_256, type_int16_256, type_int16_256) as (input_activation_in, weight_layer0_in, weight_layer1_in, weight_layer2_in, weight_layer3_in, output_activation_out):
+    with rt.sequence(type_int16_4096_2d, type_int16_4096, type_int16_4096, type_int16_4096, type_int16_4096, type_int16_4096) as (input_activation_in, weight_layer0_in, weight_layer1_in, weight_layer2_in, weight_layer3_in, output_activation_out):
         # Start Workers
         rt.start(*Workers)
         # Fills
@@ -110,8 +117,8 @@ def gui_design_jit(input_activation, weight_layer0, weight_layer1, weight_layer2
         rt.fill(weights_col1_fifo.prod(), weight_layer1_in, placement=Tile(1, 0))
         rt.fill(weights_col2_fifo.prod(), weight_layer2_in, placement=Tile(2, 0))
         rt.fill(weights_col3_fifo.prod(), weight_layer3_in, placement=Tile(3, 0))
-        # Drain
-        rt.drain(output_activation_fifo.cons(), output_activation_out, placement=Tile(3, 0), wait=True)
+        # Drains
+        rt.drain(output_activation_fifo.cons(), output_activation_out, wait=True, placement=Tile(3, 0))
 
     # Program
     my_program = Program(iron.get_current_device(), rt)
@@ -121,10 +128,11 @@ def gui_design_jit(input_activation, weight_layer0, weight_layer1, weight_layer2
 
 
 def main():
-    M, K, N = 16, 16, 16  # layer dimensions; each tile handles N//4 = 4 output features
+    # DIM_M=64, DIM_K=64, DIM_N=16; 4 workers per column → N=64 output features per layer
+    M, K, N = 64, 64, 64
 
-    input_activation = iron.zeros(256 * 256, dtype=np.int16, device="npu")
-    input_activation.data[:] = np.arange(256 * 256, dtype=np.int16)
+    input_activation = iron.zeros(M * K, dtype=np.int16, device="npu")
+    input_activation.data[:] = np.arange(M * K, dtype=np.int16)
     input_activation._sync_to_device()
     weight_layer0 = iron.arange(K * N, dtype=np.int16, device="npu")
     weight_layer1 = iron.arange(K * N, dtype=np.int16, device="npu")
@@ -136,20 +144,25 @@ def main():
     actual = np.array(output_activation, dtype=np.int16)
     print("NPU output (first 16):", actual[:16])
 
-    # Reference: 4-layer MLP, relu on layers 0-2, no relu on layer 3
-    x_np  = np.array(input_activation, dtype=np.int16)[:M * K].reshape(M, K).astype(np.int32)
+    # Reference: 4-layer MLP, relu on layers 0-2, softmax on layer 3
+    x_np  = np.array(input_activation, dtype=np.int16).reshape(M, K).astype(np.int32)
     w0_np = np.array(weight_layer0, dtype=np.int16).reshape(K, N).astype(np.int32)
     w1_np = np.array(weight_layer1, dtype=np.int16).reshape(K, N).astype(np.int32)
     w2_np = np.array(weight_layer2, dtype=np.int16).reshape(K, N).astype(np.int32)
     w3_np = np.array(weight_layer3, dtype=np.int16).reshape(K, N).astype(np.int32)
 
     def i16_relu(x): return np.maximum(x.astype(np.int16).astype(np.int32), 0)
-    def i16(x):      return x.astype(np.int16).astype(np.int32)
+    def i16_softmax_rowwise(x):
+        # softmax_i16 kernel processes DIM_N=16 elements per call (one output row)
+        x_f = x.astype(np.float32)
+        e = np.exp(x_f - x_f.max(axis=-1, keepdims=True))
+        s = e / e.sum(axis=-1, keepdims=True)
+        return (s * 32767).clip(-32768, 32767).astype(np.int16).astype(np.int32)
 
-    h1 = i16_relu(x_np  @ w0_np)
-    h2 = i16_relu(h1    @ w1_np)
-    h3 = i16_relu(h2    @ w2_np)
-    h4 = i16     (h3    @ w3_np)
+    h1 = i16_relu          (x_np @ w0_np)
+    h2 = i16_relu          (h1   @ w1_np)
+    h3 = i16_relu          (h2   @ w2_np)
+    h4 = i16_softmax_rowwise(h3  @ w3_np)
     expected = h4.astype(np.int16).flatten()
 
     print("Expected  (first 16):", expected[:16])
@@ -163,7 +176,10 @@ def main():
             print(f"  [{idx}] expected={expected[idx]}, actual={actual[idx]}")
         if len(mismatches) > 5:
             print(f"  ... and {len(mismatches) - 5} more")
-
+    #     for idx in mismatches[:5]:
+    #         print(f"  [{idx}] expected={expected[idx]}, actual={actual[idx]}")
+    #     if len(mismatches) > 5:
+    #         print(f"  ... and {len(mismatches) - 5} more")
 
 
 if __name__ == "__main__":
